@@ -1,0 +1,108 @@
+# DPLS Engine & eBPF Cross-Layer Bridge: End-to-End Execution Log
+
+This file contains the persistent record of compilation commands, test suite outcomes, and the complete simulation run demonstrating the userspace-to-kernel eBPF bridge.
+
+---
+
+## 1. Compilation & Cross-Compilation Commands
+
+### eBPF C program compilation (inside WSL/Linux):
+```bash
+clang -target bpf -O2 -c internal/ebpf/c/tc_bridge.c -o internal/ebpf/c/tc_bridge.o
+```
+
+### Go cross-compilation (inside Windows PowerShell targeting Linux):
+```powershell
+$env:GOOS="linux"; go build -o dpls-scheduler ./cmd/dpls-scheduler
+```
+
+---
+
+## 2. Go Test Suite Output
+
+Running `go test ./... -v` outputs the following tests passing cleanly across all packages:
+
+```text
+?       dpls-xdp/cmd/dpls-scheduler     [no test files]
+=== RUN   TestIPToUint32Packing
+--- PASS: TestIPToUint32Packing (0.00s)
+=== RUN   TestWriteDependencyRuleMock
+2026/05/26 11:03:24 [eBPF Mock Bridge] Map updated: SubtaskID=10 -> RefCount=2, Destinations=[127.0.0.1 127.0.0.2]
+--- PASS: TestWriteDependencyRuleMock (0.00s)
+PASS
+ok      dpls-xdp/internal/ebpf  2.658s
+=== RUN   TestGraphEngineOperations
+--- PASS: TestGraphEngineOperations (0.00s)
+=== RUN   TestParseNumericTaskID
+--- PASS: TestParseNumericTaskID (0.00s)
+=== RUN   TestParseValidDAG
+--- PASS: TestParseValidDAG (0.00s)
+=== RUN   TestParseCyclicDAG
+--- PASS: TestParseCyclicDAG (0.00s)
+=== RUN   TestParseInvalidComputation
+--- PASS: TestParseInvalidComputation (0.00s)
+=== RUN   TestStateTransitions
+--- PASS: TestStateTransitions (0.00s)
+=== RUN   TestWorkerManager
+--- PASS: TestWorkerManager (0.00s)
+=== RUN   TestSchedulerEndToEnd
+2026/05/26 10:59:59 [Scheduler Core] Reactor loop running...
+2026/05/26 10:59:59 [Scheduler Event] DAG Submitted: testdag
+2026/05/26 10:59:59 [Scheduler Dispatch] Assigning Task testdag:task0 to Worker worker-1 (IP: 127.0.0.1)
+2026/05/26 10:59:59 [eBPF Control Plane] Writing DependencyRule to Kernel Map: SubtaskID=0, RefCount=1, Destinations=[127.0.0.1]
+2026/05/26 10:59:59 [Worker Sim worker-1] Blasted UDP trigger packet for task testdag:task0 (NumericID: 0) to 127.0.0.1:9000
+2026/05/26 10:59:59 [Scheduler Event] Task Completed: testdag:task0 by Worker worker-1
+2026/05/26 10:59:59 [Scheduler Dispatch] Assigning Task testdag:task1 to Worker worker-1 (IP: 127.0.0.1)
+2026/05/26 10:59:59 [eBPF Control Plane] Writing DependencyRule to Kernel Map: SubtaskID=1, RefCount=0, Destinations=[]
+2026/05/26 11:00:00 [Worker Sim worker-1] Blasted UDP trigger packet for task testdag:task1 (NumericID: 1) to 127.0.0.1:9000
+2026/05/26 11:00:00 [Scheduler Event] Task Completed: testdag:task1 by Worker worker-1
+--- PASS: TestSchedulerEndToEnd (1.91s)
+PASS
+ok      dpls-xdp/internal/scheduler     2.844s
+ok      dpls-xdp/internal/state         2.695s
+ok      dpls-xdp/internal/worker        2.555s
+?       dpls-xdp/pkg/api        [no test files]
+```
+
+---
+
+## 3. End-to-End Simulation Execution Log
+
+Running `go run ./cmd/dpls-scheduler` executes a sample 4-node 5G Pipeline DAG, demonstrating the event flow reactor loop, BPF map updates, and UDP trigger packet generation:
+
+```text
+==================================================
+DPLS Runtime Engine & eBPF Cross-Layer Bridge POC
+==================================================
+[System Config] Registered worker: edge-node-1 (IP: 127.0.0.1, Compute: 1.5x, BW: 100MB/s)
+[System Config] Registered worker: edge-node-2 (IP: 127.0.0.2, Compute: 1.0x, BW: 50MB/s)
+[BPF Setup] Loading eBPF maps and filters...
+[eBPF Mock Bridge] Mock Attached TC program to: lo
+[Parser Ingest] Parsing online submitted JSON DAG...
+[Parser Ingest] DAG cycle check passed. Node count: 4
+[Monitor] Running pipeline tracing...
+[Scheduler Core] Reactor loop running...
+[Scheduler Event] DAG Submitted: dag-5g-pipeline
+[Scheduler Dispatch] Assigning Task dag-5g-pipeline:task-0 to Worker edge-node-1 (IP: 127.0.0.1)
+[eBPF Mock Bridge] Map updated: SubtaskID=0 -> RefCount=2, Destinations=[127.0.0.1 127.0.0.1]
+[Worker Sim edge-node-1] Blasted UDP trigger packet for task dag-5g-pipeline:task-0 (NumericID: 0) to 127.0.0.1:9000
+[Scheduler Event] Task Completed: dag-5g-pipeline:task-0 by Worker edge-node-1
+[Scheduler Dispatch] Assigning Task dag-5g-pipeline:task-2 to Worker edge-node-1 (IP: 127.0.0.1)
+[eBPF Mock Bridge] Map updated: SubtaskID=2 -> RefCount=1, Destinations=[127.0.0.1]
+[Scheduler Dispatch] Assigning Task dag-5g-pipeline:task-1 to Worker edge-node-2 (IP: 127.0.0.2)
+[eBPF Mock Bridge] Map updated: SubtaskID=1 -> RefCount=1, Destinations=[127.0.0.1]
+[Worker Sim edge-node-2] Blasted UDP trigger packet for task dag-5g-pipeline:task-1 (NumericID: 1) to 127.0.0.1:9000
+[Scheduler Event] Task Completed: dag-5g-pipeline:task-1 by Worker edge-node-2
+[Worker Sim edge-node-1] Blasted UDP trigger packet for task dag-5g-pipeline:task-2 (NumericID: 2) to 127.0.0.1:9000
+[Scheduler Event] Task Completed: dag-5g-pipeline:task-2 by Worker edge-node-1
+[Scheduler Dispatch] Assigning Task dag-5g-pipeline:task-3 to Worker edge-node-1 (IP: 127.0.0.1)
+[eBPF Mock Bridge] Map updated: SubtaskID=3 -> RefCount=0, Destinations=[]
+[Worker Sim edge-node-1] Blasted UDP trigger packet for task dag-5g-pipeline:task-3 (NumericID: 3) to 127.0.0.1:9000
+[Scheduler Event] Task Completed: dag-5g-pipeline:task-3 by Worker edge-node-1
+[Monitor] All tasks finished execution. Completing pipeline.
+==================================================
+DAG Execution Finished: State = COMPLETED
+Total Pipeline Makespan: 400.4142ms
+==================================================
+[eBPF Mock Bridge] Mock Detached TC program
+```

@@ -345,7 +345,36 @@ The Worker Management Layer represents heterogeneous edge computational nodes.
 
 The Execution Runtime handles dispatching, event callbacks, and dependency clearing.
 
-* **Task Dispatcher**: Operates as a loop that matches the top task from the Priority Queue to the optimal idle worker. If no worker is available, the task remains in the queue.
+* **Task Dispatcher**: Operates as a loop that matches the top task from the Priority Queue to the optimal idle worker. If no worker is available, the task remains in the queue. 
+
+  To bridge the userspace decisions with kernel network bypass, dispatching must follow the **Golden Rule**: program the network (eBPF) *after* determining successor edge nodes, but *before* the parent task completes and fires its output payload.
+
+  ```go
+  func DispatchTask(task *Subtask, assignedNode string) {
+      // 1. Find out who needs the output of this task
+      successors := GetSuccessors(task.ID)
+      
+      // 2. Determine where those successors are going to run.
+      // Tentatively or permanently assign worker IPs to successors using DPLS heuristic.
+      var destIPs []string
+      for _, succ := range successors {
+          destIPs = append(destIPs, succ.AssignedNodeIP)
+      }
+
+      // 3. Build the DependencyRule contract
+      rule := DependencyRule{
+          SubtaskID:    task.ID,
+          RefCount:     uint32(len(successors)),
+          Destinations: destIPs,
+      }
+
+      // 4. Call Control Plane Bridge to load rule into BPF map
+      ebpf_bridge.WriteDependencyRuleToKernel(rule)
+
+      // 5. Trigger task execution on the assigned node/worker
+      ExecuteWorker(task)
+  }
+  ```
 * **Callback Registry**: Registers completion channels or callback functions for every dispatched task. When a worker goroutine finishes, it invokes the callback.
 * **Dependency Unlock Handling**: The callback triggers a traversal of the task's successors. For each successor:
   1. The task's dynamic remaining dependencies counter is decremented.
@@ -429,7 +458,8 @@ Time  Event Ingestion                   Scheduler Pipeline                    Wo
  │                           3. Push Task-1 to Global PQ
  │                           4. Re-evaluate PQ orders (Contention check)
  │                           5. Pop highest priority task: Task-1
- │                           6. Assign Task-1 to Worker-1
+ │                           6. Write eBPF Map rule: ebpf_bridge.WriteDependencyRule(Task-1, successors)
+ │                           7. Assign Task-1 to Worker-1
  │                                                                                
  └─► [Event: TASK_DISPATCH] ─────────────────────────────────────────────────────► [Worker-1 starts Task-1]
 ```
@@ -442,6 +472,8 @@ Time  Event Ingestion                   Scheduler Pipeline                    Wo
    - The scheduler loop receives the queue update.
    - It pops the highest priority task.
    - It selects the best fit worker (evaluating minimum $EFT$).
+   - It invokes the control plane bridge to write the dependency routing rule to the eBPF Map (the Vault):
+     `ebpf_bridge.WriteDependencyRule(task.ID, successors)`
    - It marks the task `RUNNING` and worker `BUSY`.
    - It fires a goroutine to simulate execution duration.
 5. **Execution & Return**:
@@ -512,6 +544,8 @@ package types
 
 import (
 	"container/heap"
+	"encoding/binary"
+	"net"
 	"time"
 )
 
@@ -530,6 +564,13 @@ const (
 type Dependency struct {
 	TargetTaskID string `json:"task_id"`
 	DataSize     int64  `json:"data_size"` // Bytes
+}
+
+// DependencyRule represents the contract between Go scheduler and eBPF kernel program.
+type DependencyRule struct {
+	SubtaskID    uint32   // The ID of the task that is ABOUT to run
+	RefCount     uint32   // How many successor tasks need its output? (Fan-out)
+	Destinations []string // The IP addresses of the edge nodes running the successors
 }
 
 // TaskNode represents a task inside a DAG.
@@ -645,7 +686,7 @@ To avoid complex multi-threaded locking schemes and race conditions, the DPLS ru
   }
   ```
 * **Worker Execution Concurrency**:
-  When a task is dispatched, the scheduler spawns a separate worker executor goroutine. This keeps the scheduler loop unblocked:
+  When a task is dispatched, the scheduler spawns a separate worker executor goroutine. This keeps the scheduler loop unblocked. To bridge the simulation with the physical network layer, the worker goroutine is modified to send a real UDP payload upon completing its simulated CPU duration, triggering the kernel-level eBPF TC hook attached to the network interface:
   ```go
   go func(worker *Worker, task *TaskNode) {
       // 1. Calculate simulated duration
@@ -654,7 +695,19 @@ To avoid complex multi-threaded locking schemes and race conditions, the DPLS ru
       // 2. Simulate computation using time.Sleep
       time.Sleep(duration)
       
-      // 3. Dispatch completion event back to scheduler
+      // 3. Generate a real network packet to trigger the eBPF TC hook
+      // Convert SubtaskID to 4 bytes in little-endian order so eBPF can easily parse it
+      payload := make([]byte, 4)
+      binary.LittleEndian.PutUint32(payload, task.ID) // Assuming task.ID is cast/stored as uint32
+
+      // Send to a dummy port representing the target interface or node
+      targetAddr := "127.0.0.1:9000"
+      if conn, err := net.Dial("udp", targetAddr); err == nil {
+          _, _ = conn.Write(payload)
+          _ = conn.Close()
+      }
+      
+      // 4. Dispatch completion event back to scheduler
       s.eventChan <- Event{
           Type: EventTaskCompleted,
           TaskID: task.ID,
@@ -694,9 +747,15 @@ dpls-xdp/
 │   ├── worker/
 │   │   ├── manager.go              # Simulates heterogeneous worker capacities
 │   │   └── manager_test.go
-│   └── state/
-│       ├── manager.go              # Coordinates task/DAG/worker state transitions
-│       └── manager_test.go
+│   ├── state/
+│   │   ├── manager.go              # Coordinates task/DAG/worker state transitions
+│   │   └── manager_test.go
+│   └── ebpf/                       # eBPF control plane loader and kernel C program
+│       ├── c/
+│       │   ├── tc_bridge.c         # Traffic Control BPF program in C
+│       │   └── bpf_helpers.h       # BPF helper macros
+│       ├── loader.go               # Wrapper using cilium/ebpf to load/attach/program maps
+│       └── loader_test.go
 ├── configs/
 │   └── scheduler_config.json       # Scheduler settings (aging factor, concurrency parameters)
 ├── go.mod
@@ -716,6 +775,9 @@ Phase 1: Ingestion & Validation
                  └─ Phase 6: Scheduler Core Loop
                      └─ Phase 7: Online Multi-DAG Integration
                          └─ Phase 8: Metrics & Instrumentation
+                             └─ Phase 9: eBPF Kernel-Space Dataplane
+                                 └─ Phase 10: eBPF Userspace Control Plane Loader
+                                     └─ Phase 11: End-to-End Network Bypass Loop
 ```
 
 ### Phase 1: Ingestion & Validation
@@ -765,6 +827,24 @@ Phase 1: Ingestion & Validation
 * **Components**: Whole workspace.
 * **Expected Outputs**: Structured JSON logs tracking make-span and resource utilization.
 * **Testing Objectives**: Confirm that the scheduler logs trace events for task starts, worker states, and DAG completion times.
+
+### Phase 9: eBPF Kernel-Space Dataplane Development
+* **Goal**: Build the kernel-space packet processing dataplane using eBPF TC hooks.
+* **Components**: `internal/ebpf/c/tc_bridge.c`, `internal/ebpf/c/bpf_helpers.h`.
+* **Expected Outputs**: BPF C source file defining maps (`BPF_MAP_TYPE_HASH` for task dependencies and `BPF_MAP_TYPE_LRU_HASH` for payload caching) and the packet interception/lookup logic.
+* **Testing Objectives**: Verify the C program compiles using `clang -target bpf -O2` into an ELF object file.
+
+### Phase 10: eBPF Userspace Control Plane Loader
+* **Goal**: Implement the userspace loader and BPF map programming utility.
+* **Components**: `internal/ebpf/loader.go`.
+* **Expected Outputs**: Go bridge that loads the compiled eBPF ELF file, attaches the TC program to the loopback interface (`lo`), and provides `WriteDependencyRule(taskID, successors)` API to write into the BPF hash map.
+* **Testing Objectives**: Verify loader attaches to local network interfaces without permission errors (when run as root) and successfully writes mock entries to the hash map.
+
+### Phase 11: End-to-End Simulation & Network Loop Verification
+* **Goal**: Complete the integration loop to execute real socket communication with eBPF network bypass.
+* **Components**: `internal/scheduler/core.go`, `internal/worker/manager.go`, `internal/ebpf/loader.go`.
+* **Expected Outputs**: End-to-end scheduling run where completed tasks trigger raw UDP socket traffic, which is intercepted at the kernel layer by the loopback-attached TC program and validated against the Go-populated BPF map.
+* **Testing Objectives**: Run the integrated test suite on a Linux environment, dump `/sys/kernel/debug/tracing/trace_pipe` outputs, and confirm that the intercept print statements (`Intercepted Task X`) match sent UDP packets.
 
 ---
 

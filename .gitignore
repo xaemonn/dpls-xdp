@@ -1,0 +1,5 @@
+# Compiled binaries
+dpls-scheduler
+dpls-scheduler.exe
+*.o
+*.exe
