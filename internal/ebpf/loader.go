@@ -1,3 +1,14 @@
+//go:build !linux
+// +build !linux
+
+// Package ebpf provides a MOCK implementation of the eBPF control plane for
+// non-Linux systems (Windows, macOS). This is used for:
+//   - Local development and compilation on developer machines
+//   - Cross-platform unit testing (go test ./...)
+//   - CI/CD pipelines without a Linux kernel
+//
+// On Linux, loader_linux.go compiles instead, providing the real bpf() syscall
+// integration via the cilium/ebpf library.
 package ebpf
 
 import (
