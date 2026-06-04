@@ -31,6 +31,7 @@
 #include <linux/ip.h>
 #include <linux/udp.h>
 #include <linux/pkt_cls.h>
+#include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -152,7 +153,7 @@ static __always_inline struct udphdr *get_udp_hdr(struct iphdr *ip, void *data_e
 //   → Return TC_ACT_OK: packet continues to (now modified) destination
 //
 SEC("tc")
-int tc_ingress(struct __sk_buff *skb)
+int dpls_tc_ingress(struct __sk_buff *skb)
 {
     // ── Step 1: Get packet data boundaries ───────────────────────────────────
     // The eBPF verifier REQUIRES bounds checks on every pointer access.
@@ -272,7 +273,7 @@ int tc_ingress(struct __sk_buff *skb)
 // Attach to egress to intercept packets LEAVING a worker node.
 // Allows rewriting destination on outbound packets (alternative attachment point).
 SEC("tc_egress")
-int tc_egress(struct __sk_buff *skb)
+int dpls_tc_egress(struct __sk_buff *skb)
 {
     // Egress uses the same logic as ingress — identical parsing and routing.
     // Egress attachment is used when the worker node is the SOURCE of the packet.
