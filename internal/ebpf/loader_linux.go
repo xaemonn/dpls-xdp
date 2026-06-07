@@ -66,6 +66,7 @@ var (
 	retentionMap *ebpf.Map       // Handle to retention_map in the kernel
 	tcIngressProg *ebpf.Program  // Handle to the dpls_tc_ingress BPF program
 	tcEgressProg  *ebpf.Program  // Handle to the dpls_tc_egress BPF program
+	sendmsg4Prog  *ebpf.Program  // Handle to the dpls_cgroup_connect4 BPF program
 	attachedIface string         // Name of the interface TC programs are attached to
 )
 
@@ -142,6 +143,11 @@ func LoadBPFObjects(elfPath string) error {
 	tcEgressProg, ok = coll.Programs["dpls_tc_egress"]
 	if !ok || tcEgressProg == nil {
 		log.Printf("[eBPF Loader] Warning: dpls_tc_egress not found — egress filtering disabled")
+	}
+
+	sendmsg4Prog, ok = coll.Programs["dpls_cgroup_connect4"]
+	if !ok || sendmsg4Prog == nil {
+		log.Printf("[eBPF Loader] Warning: dpls_cgroup_connect4 not found — sender bypass disabled")
 	}
 
 	log.Printf("[eBPF Loader] Successfully loaded BPF maps and programs into kernel memory")
@@ -285,8 +291,19 @@ func WriteDependencyRuleToKernel(rule api.DependencyRule) error {
 		if ipv4 == nil {
 			return fmt.Errorf("[eBPF Real Bridge] %q is not an IPv4 address", ipStr)
 		}
-		// binary.BigEndian = network byte order (what the kernel and C program expect)
-		kernelRule.DestIPs[i] = binary.BigEndian.Uint32(ipv4)
+		// BPF maps on x86 store values in HOST byte order (little-endian).
+		// The C struct field `__u32 dest_ips[MAX_FANOUT]` is host-order.
+		// bpf_skb_store_bytes() writes it directly into the packet's daddr field,
+		// which the kernel also holds in network byte order (big-endian).
+		// HOWEVER: bpf_l3_csum_replace() and bpf_skb_store_bytes() work with the
+		// raw packet bytes, so new_daddr must be in NETWORK byte order (big-endian).
+		// The C code does: __u32 new_daddr = rule->dest_ips[0]
+		//   then:          bpf_skb_store_bytes(skb, IP_DADDR_OFF, &new_daddr, ...)
+		// This means dest_ips must contain the IP in NETWORK byte order.
+		// cilium/ebpf marshals Go uint32 fields using the native (little-endian) layout,
+		// so we must store the big-endian bytes AS a little-endian uint32, which means
+		// reading the 4-byte big-endian slice as little-endian:
+		kernelRule.DestIPs[i] = binary.LittleEndian.Uint32(ipv4)
 	}
 
 	// Write into vault_map: key=SubtaskID, value=kernelDependencyRule.

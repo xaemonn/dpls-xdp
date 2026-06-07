@@ -24,3 +24,6 @@ Dynamic_Caching_*.pdf
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Ignore all markdown files (like claude.md, gemini.md)
+*.md

@@ -326,4 +326,45 @@ int dpls_tc_egress(struct __sk_buff *skb)
     return TC_ACT_OK;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CGROUP CONNECT4 PROGRAM (Sender-side bypass)
+// ─────────────────────────────────────────────────────────────────────────────
+// Attach to cgroup/connect4 to intercept connect() syscalls before the IP stack.
+// This allows us to rewrite the destination IP *before* iptables DNAT rules are
+// evaluated, completely bypassing kube-proxy overhead.
+SEC("cgroup/connect4")
+int dpls_cgroup_connect4(struct bpf_sock_addr *ctx)
+{
+    // Ensure this is IPv4 (AF_INET = 2 in Linux)
+    if (ctx->family != 2)
+        return 1; // pass
+
+    // Filter by target port. Task ID is encoded in the port: 9000 + task_id
+    __u32 dest_port = bpf_ntohs(ctx->user_port);
+    if (dest_port < WORKER_TRIGGER_PORT || dest_port >= WORKER_TRIGGER_PORT + 100)
+        return 1; // not our traffic
+
+    __u32 task_id = dest_port - WORKER_TRIGGER_PORT;
+
+    // Look up vault_map for real destination
+    struct dependency_rule *rule = bpf_map_lookup_elem(&vault_map, &task_id);
+    if (!rule)
+        return 1; // pass
+
+    __u32 real_ip = rule->dest_ips[0];
+    if (real_ip == 0)
+        return 1; // exit node
+
+    // Rewrite destination to real pod IP and reset port to 9000
+    // Because this happens at the syscall layer, the Linux IP stack will
+    // build the packet for the REAL IP, completely skipping the iptables DNAT
+    // rule that would have translated the Service ClusterIP.
+    ctx->user_ip4 = real_ip;
+    ctx->user_port = bpf_htons(WORKER_TRIGGER_PORT);
+
+    bpf_printk("CGROUP-BPF: Task=%u redirected to 0x%08x\n", task_id, bpf_ntohl(real_ip));
+
+    return 1; // allow connection
+}
+
 char _license[] SEC("license") = "GPL";
