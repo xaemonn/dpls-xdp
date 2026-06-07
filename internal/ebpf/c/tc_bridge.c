@@ -31,6 +31,7 @@
 #include <linux/ip.h>
 #include <linux/udp.h>
 #include <linux/pkt_cls.h>
+#include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -152,7 +153,7 @@ static __always_inline struct udphdr *get_udp_hdr(struct iphdr *ip, void *data_e
 //   → Return TC_ACT_OK: packet continues to (now modified) destination
 //
 SEC("tc")
-int tc_ingress(struct __sk_buff *skb)
+int dpls_tc_ingress(struct __sk_buff *skb)
 {
     // ── Step 1: Get packet data boundaries ───────────────────────────────────
     // The eBPF verifier REQUIRES bounds checks on every pointer access.
@@ -272,7 +273,7 @@ int tc_ingress(struct __sk_buff *skb)
 // Attach to egress to intercept packets LEAVING a worker node.
 // Allows rewriting destination on outbound packets (alternative attachment point).
 SEC("tc_egress")
-int tc_egress(struct __sk_buff *skb)
+int dpls_tc_egress(struct __sk_buff *skb)
 {
     // Egress uses the same logic as ingress — identical parsing and routing.
     // Egress attachment is used when the worker node is the SOURCE of the packet.
@@ -323,6 +324,47 @@ int tc_egress(struct __sk_buff *skb)
     bpf_skb_store_bytes(skb, IP_DADDR_OFF, &new_daddr, sizeof(__u32), 0);
 
     return TC_ACT_OK;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CGROUP CONNECT4 PROGRAM (Sender-side bypass)
+// ─────────────────────────────────────────────────────────────────────────────
+// Attach to cgroup/connect4 to intercept connect() syscalls before the IP stack.
+// This allows us to rewrite the destination IP *before* iptables DNAT rules are
+// evaluated, completely bypassing kube-proxy overhead.
+SEC("cgroup/connect4")
+int dpls_cgroup_connect4(struct bpf_sock_addr *ctx)
+{
+    // Ensure this is IPv4 (AF_INET = 2 in Linux)
+    if (ctx->family != 2)
+        return 1; // pass
+
+    // Filter by target port. Task ID is encoded in the port: 9000 + task_id
+    __u32 dest_port = bpf_ntohs(ctx->user_port);
+    if (dest_port < WORKER_TRIGGER_PORT || dest_port >= WORKER_TRIGGER_PORT + 100)
+        return 1; // not our traffic
+
+    __u32 task_id = dest_port - WORKER_TRIGGER_PORT;
+
+    // Look up vault_map for real destination
+    struct dependency_rule *rule = bpf_map_lookup_elem(&vault_map, &task_id);
+    if (!rule)
+        return 1; // pass
+
+    __u32 real_ip = rule->dest_ips[0];
+    if (real_ip == 0)
+        return 1; // exit node
+
+    // Rewrite destination to real pod IP and reset port to 9000
+    // Because this happens at the syscall layer, the Linux IP stack will
+    // build the packet for the REAL IP, completely skipping the iptables DNAT
+    // rule that would have translated the Service ClusterIP.
+    ctx->user_ip4 = real_ip;
+    ctx->user_port = bpf_htons(WORKER_TRIGGER_PORT);
+
+    bpf_printk("CGROUP-BPF: Task=%u redirected to 0x%08x\n", task_id, bpf_ntohl(real_ip));
+
+    return 1; // allow connection
 }
 
 char _license[] SEC("license") = "GPL";

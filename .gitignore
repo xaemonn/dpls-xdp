@@ -24,3 +24,7 @@ Dynamic_Caching_*.pdf
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Ignore all markdown files (like claude.md, gemini.md) EXCEPT the main experiments result
+*.md
+!comprehensive_experiments.md

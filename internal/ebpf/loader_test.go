@@ -1,6 +1,7 @@
 package ebpf
 
 import (
+	"runtime"
 	"testing"
 
 	"dpls-xdp/pkg/api"
@@ -25,6 +26,10 @@ func TestIPToUint32Packing(t *testing.T) {
 }
 
 func TestWriteDependencyRuleMock(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Skipping mock test on Linux since it expects real eBPF maps")
+	}
+
 	rule := api.DependencyRule{
 		SubtaskID:    10,
 		RefCount:     2,
